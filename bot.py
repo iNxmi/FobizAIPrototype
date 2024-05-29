@@ -1,15 +1,27 @@
+import aspose.words
 import hikari
 import lightbulb
 import json
 import os
-
+import time
 
 from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# delete temp files
+for f in os.listdir(f'temp'):
+    os.unlink(f'temp/{f}')
+
 openai_client = OpenAI()
+openai_assistant = openai_client.beta.assistants.create(
+    name='Fobiz AI Prototype',
+    instructions='You are a personal tutor. Read all files and answer questions only based on these files.',
+    tools=[{"type": "file_search"}],
+    model="gpt-4o",
+)
+
 bot = lightbulb.BotApp(
     token=os.getenv("BOT_TOKEN"),
     help_slash_command=True,
@@ -18,28 +30,68 @@ bot = lightbulb.BotApp(
 
 
 @bot.command
+@lightbulb.option(name='course', description='course', required=True)
 @lightbulb.option(name='prompt', description='prompt', required=True)
 @lightbulb.command(name='prompt', description='prompt')
 @lightbulb.implements(lightbulb.SlashCommand)
-async def ask(ctx: lightbulb.SlashContext) -> None:
+async def prompt(ctx: lightbulb.SlashContext) -> None:
     await ctx.respond(response_type=hikari.ResponseType.DEFERRED_MESSAGE_CREATE)
 
-    completion = openai_client.chat.completions.create(
-        model="gpt-3.5-turbo",
+    ms = round(time.time() * 1000)
+
+    vector_store = openai_client.beta.vector_stores.create(name=str(ms))
+
+    lst = os.listdir(f'data/courses/{ctx.options.course}/files')
+    file_paths = []
+    for l in lst:
+        path = f'data/courses/{ctx.options.course}/files/{l}'
+        if os.path.isfile(path):
+            file_paths.append(path)
+
+    file_streams = [open(path, "rb") for path in file_paths]
+    file_batch = openai_client.beta.vector_stores.file_batches.upload_and_poll(
+        vector_store_id=vector_store.id, files=file_streams
+    )
+
+    print(file_batch.status)
+    print(file_batch.file_counts)
+
+    assistant = openai_client.beta.assistants.update(
+        assistant_id=openai_assistant.id,
+        tool_resources={"file_search": {"vector_store_ids": [vector_store.id]}},
+    )
+
+    thread = openai_client.beta.threads.create(
         messages=[
-            {"role": "system", "content": "You are a poetic assistant, skilled in explaining complex programming concepts with creative flair."},
             {"role": "user", "content": ctx.options.prompt}
         ]
     )
 
-    await ctx.respond(completion.choices[0].message.content)
+    run = openai_client.beta.threads.runs.create_and_poll(
+        thread_id=thread.id,
+        assistant_id=assistant.id
+    )
 
+    messages = list(openai_client.beta.threads.messages.list(thread_id=thread.id, run_id=run.id))
 
-# @bot.command
-# @lightbulb.command(name='compare', description='compare', aliases=['vergleichen'])
-# @lightbulb.implements(lightbulb.SlashCommand)
-# async def compare(ctx: lightbulb.SlashContext) -> None:
-#     await ctx.respond("compare")
+    message_content = messages[0].content[0].text
+    annotations = message_content.annotations
+    citations = []
+    for index, annotation in enumerate(annotations):
+        message_content.value = message_content.value.replace(annotation.text, f"[{index}]")
+        if file_citation := getattr(annotation, "file_citation", None):
+            cited_file = openai_client.files.retrieve(file_citation.file_id)
+            citations.append(f"[{index}] {cited_file.filename}")
+
+    print(message_content.value)
+    print("\n".join(citations))
+
+    path = f'temp/{ms}.txt'
+    file = open(path, 'w')
+    file.write(message_content.value)
+    file.close()
+
+    await ctx.respond(hikari.File(path))
 
 
 @bot.command
